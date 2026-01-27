@@ -6,7 +6,6 @@ import torchaudio
 from huggingface_hub import snapshot_download
 from omegaconf import OmegaConf
 
-# Настройка кэша HuggingFace
 os.environ["HF_HOME"] = os.getenv("HF_CACHE_DIR", "/models/hf")
 
 try:
@@ -19,7 +18,7 @@ except ImportError as e:
 def log(msg):
     print(f"[TTS-ENGINE] {msg}", flush=True)
 
-# Генераторы памяти (Sinusoidal PE для сложения, Float32)
+# Генератор Sinusoidal PE (Float32)
 def get_sinusoidal_pe(pos_len: int, dim: int):
     pe = torch.zeros(pos_len, dim)
     position = torch.arange(0, pos_len, dtype=torch.float).unsqueeze(1)
@@ -34,7 +33,6 @@ class F5TTSWrapper:
         self.repo_id = repo_id
         
         log(f"Initializing F5-TTS on device: {self.device}")
-        log(f"Cache dir: {os.environ['HF_HOME']}")
 
         # 1. Скачивание
         try:
@@ -47,11 +45,18 @@ class F5TTSWrapper:
         self.checkpoint_file = self._find_file(self.model_path, [".pt", ".safetensors"], "model_")
         self.vocab_file = self._find_file(self.model_path, ["vocab.txt"])
         
-        # 3. Референс
+        # 3. Референс (Обрезаем до 5 сек для скорости)
         self.ref_audio = "/app/ref_audio.wav"
-        # Обрезаем референс до 6 сек для скорости
-        self._trim_reference_audio(self.ref_audio, max_sec=6.0)
-        self.ref_text = "Пример голоса." 
+        self._trim_reference_audio(self.ref_audio, max_sec=5.0)
+        self.ref_text = "Пример." 
+
+        # Вычисляем длину референса в семплах (для обрезки output)
+        if os.path.exists(self.ref_audio):
+            wav, sr = torchaudio.load(self.ref_audio)
+            # F5 работает на 24kHz
+            self.ref_len_samples = int(wav.shape[1] * 24000 / sr)
+        else:
+            self.ref_len_samples = 0
 
         # 4. Загрузка
         log("Loading models...")
@@ -80,12 +85,11 @@ class F5TTSWrapper:
         self.ema_model = self.ema_model.to(torch.float32)
         
         # Патч памяти
-        log("Applying Sinusoidal Memory Patch (32k)...")
         self._patch_sinusoidal_memory(self.ema_model, target_len=32000)
 
         log("✅ F5-TTS Engine Ready.")
 
-    def _trim_reference_audio(self, path, max_sec=6.0):
+    def _trim_reference_audio(self, path, max_sec=5.0):
         if not os.path.exists(path): return
         try:
             waveform, sr = torchaudio.load(path)
@@ -97,7 +101,6 @@ class F5TTSWrapper:
             log(f"Ref audio warning: {e}")
 
     def _patch_sinusoidal_memory(self, module, target_len=32000):
-        patched = 0
         for name, submod in module.named_modules():
             freqs = getattr(submod, "freqs_cis", None)
             if freqs is None and hasattr(submod, "_buffers"):
@@ -105,13 +108,9 @@ class F5TTSWrapper:
             
             if freqs is not None and freqs.shape[0] < target_len:
                 dim = freqs.shape[-1]
-                # Sinusoidal PE = Real numbers
                 new_pe = get_sinusoidal_pe(target_len, dim).to(device=self.device, dtype=torch.float32)
-                
                 if hasattr(submod, "freqs_cis"): submod.freqs_cis = new_pe
                 if hasattr(submod, "_buffers"): submod._buffers["freqs_cis"] = new_pe
-                patched += 1
-        log(f"Patched {patched} buffers.")
 
     def _find_file(self, path, extensions, substring=None):
         for root, dirs, files in os.walk(path):
@@ -122,16 +121,27 @@ class F5TTSWrapper:
         return None
 
     def generate(self, text):
-        if not text: return 8000, np.zeros(0, dtype=np.float32)
+        if not text: return 24000, np.zeros(0, dtype=np.float32)
         
-        # Параметры скорости: nfe_step=16 (быстро), speed=1.1
         try:
+            # Генерация
             audio, sample_rate, _ = infer_process(
                 self.ref_audio, self.ref_text, text,
                 self.ema_model, self.vocoder, mel_spec_type="vocos",
-                device=self.device, nfe_step=16, speed=1.1
+                device=self.device, nfe_step=16, speed=1.0
             )
-            return sample_rate, audio.float().cpu().numpy() if isinstance(audio, torch.Tensor) else np.array(audio)
+            
+            # --- ВАЖНО: Убираем референс из начала ---
+            if isinstance(audio, torch.Tensor):
+                audio = audio.float().cpu().numpy()
+            
+            # Отрезаем длину референса (плюс небольшой запас 0.5с на стык)
+            cut_len = self.ref_len_samples
+            if len(audio) > cut_len:
+                 audio = audio[cut_len:]
+            # ----------------------------------------
+
+            return sample_rate, audio
         except Exception as e:
             log(f"[ERROR] Generation failed: {e}")
-            return 8000, np.zeros(0, dtype=np.float32)
+            return 24000, np.zeros(0, dtype=np.float32)
