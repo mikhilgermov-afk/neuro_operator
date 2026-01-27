@@ -1,4 +1,3 @@
-# app/tts_engine.py
 import sys
 import os
 import torch
@@ -19,7 +18,6 @@ except ImportError as e:
 def log(msg):
     print(f"[TTS-ENGINE] {msg}", flush=True)
 
-# Генератор Sinusoidal PE (Float32)
 def get_sinusoidal_pe(pos_len: int, dim: int):
     pe = torch.zeros(pos_len, dim)
     position = torch.arange(0, pos_len, dtype=torch.float).unsqueeze(1)
@@ -29,50 +27,40 @@ def get_sinusoidal_pe(pos_len: int, dim: int):
     return pe
 
 class F5TTSWrapper:
-    def __init__(self, repo_id="Misha24-10/F5-TTS_RUSSIAN", device="cuda"):
+    def __init__(self, stt_model, repo_id="Misha24-10/F5-TTS_RUSSIAN", device="cuda"):
         self.device = device
         self.repo_id = repo_id
         
         log(f"Initializing F5-TTS on device: {self.device}")
 
-        # 1. Скачивание
         try:
             self.model_path = snapshot_download(repo_id)
         except Exception as e:
             log(f"[ERROR] Download failed: {e}")
             raise e
 
-        # 2. Файлы
         self.checkpoint_file = self._find_file(self.model_path, [".pt", ".safetensors"], "model_")
         self.vocab_file = self._find_file(self.model_path, ["vocab.txt"])
         
-        # 3. Референс (Аудио + Текст)
-        self.ref_audio = "/app/ref_audio.wav"
-        self.ref_text_file = "/app/ref_audio.txt"
+        # --- НАСТРОЙКА РЕФЕРЕНСА ---
+        original_ref_audio = "/app/ref_audio.wav"
+        self.ref_audio = "/app/ref_audio_trimmed.wav" 
         
-        # Загружаем текст референса из файла, если он есть
-        if os.path.exists(self.ref_text_file):
-            with open(self.ref_text_file, "r", encoding="utf-8") as f:
-                self.ref_text = f.read().strip()
-            log(f"Loaded ref_text from file: '{self.ref_text}'")
-        else:
-            # ВАЖНО: Если вы не создали txt файл, этот текст должен совпадать с аудио!
-            self.ref_text = "Пример." 
-            log(f"[WARNING] ref_audio.txt not found! Using default text: '{self.ref_text}'. If audio differs, voice will be broken.")
+        # ВАЖНО: Уменьшили до 6.0 секунд для стабильности (убирает "глотание" букв)
+        self._prepare_safe_audio(original_ref_audio, self.ref_audio, max_sec=6.0)
 
-        # Увеличил лимит до 15 сек, чтобы не резать длинные фразы
-        self._trim_reference_audio(self.ref_audio, max_sec=15.0)
+        log("Transcribing reference audio to ensure text match...")
+        segments, _ = stt_model.transcribe(self.ref_audio, language="ru")
+        self.ref_text = " ".join([s.text for s in segments]).strip()
+        log(f"✅ Auto-detected Ref Text: '{self.ref_text}'")
 
-        # Вычисляем длину референса в семплах (для обрезки output)
         if os.path.exists(self.ref_audio):
             wav, sr = torchaudio.load(self.ref_audio)
-            # F5 работает на 24kHz
             self.ref_len_samples = int(wav.shape[1] * 24000 / sr)
         else:
             self.ref_len_samples = 0
 
-        # 4. Загрузка моделей
-        log("Loading models...")
+        log("Loading F5-TTS models...")
         self.vocoder = load_vocoder(is_local=False)
         
         model_cfg = OmegaConf.create({
@@ -94,27 +82,28 @@ class F5TTSWrapper:
             device=self.device
         )
         
-        # Стабилизация Float32
         self.ema_model = self.ema_model.to(torch.float32)
-        
-        # Патч памяти
         self._patch_sinusoidal_memory(self.ema_model, target_len=32000)
-
         log("✅ F5-TTS Engine Ready.")
 
-    def _trim_reference_audio(self, path, max_sec=15.0):
-        if not os.path.exists(path): return
+    def _prepare_safe_audio(self, src_path, dst_path, max_sec=6.0):
+        if not os.path.exists(src_path):
+            log(f"[ERROR] Original audio not found: {src_path}")
+            return
+
         try:
-            waveform, sr = torchaudio.load(path)
+            waveform, sr = torchaudio.load(src_path)
             duration = waveform.shape[1] / sr
+            
             if duration > max_sec:
-                log(f"Trimming audio from {duration:.2f}s to {max_sec}s")
+                log(f"Trimming audio from {duration:.2f}s to {max_sec}s for stability")
                 waveform = waveform[:, :int(max_sec * sr)]
-                torchaudio.save(path, waveform, sr)
             else:
-                log(f"Ref audio duration: {duration:.2f}s (ok)")
+                log(f"Audio duration {duration:.2f}s is OK")
+
+            torchaudio.save(dst_path, waveform, sr)
         except Exception as e:
-            log(f"Ref audio warning: {e}")
+            log(f"Ref audio prep failed: {e}")
 
     def _patch_sinusoidal_memory(self, module, target_len=32000):
         for name, submod in module.named_modules():
@@ -140,31 +129,31 @@ class F5TTSWrapper:
         if not text: return 24000, np.zeros(0, dtype=np.float32)
         
         try:
-            # Генерация
             audio, sample_rate, _ = infer_process(
                 self.ref_audio, self.ref_text, text,
                 self.ema_model, self.vocoder, mel_spec_type="vocos",
                 device=self.device, nfe_step=16, speed=1.0
             )
             
-            # --- ВАЖНО: Убираем референс из начала ---
             if isinstance(audio, torch.Tensor):
                 audio = audio.float().cpu().numpy()
             
-            # Отрезаем длину референса (плюс небольшой запас на кроссфейд)
-            # F5 иногда возвращает чуть меньше/больше, поэтому режем аккуратно
+            total_len = len(audio)
             cut_len = self.ref_len_samples
-            if len(audio) > cut_len:
-                 audio = audio[cut_len:]
             
-            # Дополнительная защита от "щелчка" в начале
+            # Если генерация слишком короткая (сбой), отдаем всё что есть
+            if total_len <= cut_len:
+                log(f"[WARNING] Gen too short ({total_len} <= {cut_len}). Returning full audio.")
+                return 24000, audio
+
+            audio = audio[cut_len:]
+
             if len(audio) > 0:
-                # Плавное нарастание (fade-in) на первых 500 сэмплах (20мс)
                 fade_len = min(500, len(audio))
                 fade_curve = np.linspace(0, 1, fade_len)
                 audio[:fade_len] *= fade_curve
 
-            return 24000, audio # Принудительно возвращаем 24k, так как F5 это гарантирует
+            return 24000, audio 
         except Exception as e:
             log(f"[ERROR] Generation failed: {e}")
             return 24000, np.zeros(0, dtype=np.float32)

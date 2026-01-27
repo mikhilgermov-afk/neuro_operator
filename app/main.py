@@ -1,4 +1,3 @@
-# app/main.py
 # -*- coding: utf-8 -*-
 import asyncio
 import audioop
@@ -41,7 +40,7 @@ def load_models():
     log("Loading models...")
     stt_model = WhisperModel("large-v3-turbo", device="cuda", compute_type="float16")
     llm_client = OpenAI(base_url=os.getenv("LLM_API_URL"), api_key="sk-local-key")
-    tts_engine = F5TTSWrapper()
+    tts_engine = F5TTSWrapper(stt_model=stt_model)
     log("All models loaded.")
 
 class CallHandler:
@@ -56,12 +55,13 @@ class CallHandler:
         self.ssrc = 123456
         self.is_speaking = False
         self.greeting_sent = False
+        self.start_time = 0 
+        self.packet_count = 0
 
     async def send_greeting(self):
         if self.greeting_sent: return
         self.greeting_sent = True
         try:
-            # Сразу генерируем приветствие
             log("Generating greeting...")
             sr, audio = tts_engine.generate("Алло, да, я вас слушаю.")
             await self.stream_audio_back(audio, sr)
@@ -77,13 +77,17 @@ class CallHandler:
             return 
 
         rms = audioop.rms(pcm_data, 2)
-        if rms > 300: 
+        
+        # Снизил порог до 200, чтобы слышать тихие звуки
+        if rms > 200: 
             self.silence_frames = 0
             self.audio_buffer.extend(pcm_data)
         else:
             self.silence_frames += 1
 
-        if self.silence_frames > 40 and len(self.audio_buffer) > 4000: # Чуть уменьшил порог тишины для скорости
+        # Увеличил ожидание тишины до 75 фреймов (~1.5 секунды)
+        # Бот станет "терпеливее" и не будет перебивать
+        if self.silence_frames > 75 and len(self.audio_buffer) > 4000: 
             audio_to_process = self.audio_buffer[:]
             self.audio_buffer = bytearray()
             self.silence_frames = 0
@@ -94,14 +98,11 @@ class CallHandler:
         self.is_speaking = True
         
         try:
-            # 1. Байты -> Float32
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # 2. Ресемплинг
             if len(audio_np) < 100: return
             audio_16k = scipy.signal.resample_poly(audio_np, SAMPLE_RATE_WHISPER, SAMPLE_RATE_TELEPHONY)
 
-            # 3. STT
             segments, _ = stt_model.transcribe(audio_16k, language="ru", beam_size=1)
             user_text = " ".join([s.text for s in segments]).strip()
             
@@ -112,7 +113,6 @@ class CallHandler:
             log(f"🗣️ User: {user_text}")
             self.history.append({"role": "user", "content": user_text})
 
-            # 4. LLM
             messages = prompts.create_messages(self.history)
             completion = await asyncio.to_thread(
                 llm_client.chat.completions.create,
@@ -120,14 +120,10 @@ class CallHandler:
             )
             bot_text = completion.choices[0].message.content
             
-            # Если бот все равно выдал английский (подстраховка), вырезаем латиницу или логируем
             log(f"🤖 Bot: {bot_text}")
             self.history.append({"role": "assistant", "content": bot_text})
 
-            # 5. TTS
             sr_out, audio_out = await asyncio.to_thread(tts_engine.generate, bot_text)
-            
-            # 6. Отправка
             await self.stream_audio_back(audio_out, sr_out)
 
         except Exception as e:
@@ -140,25 +136,21 @@ class CallHandler:
             error_log("TTS returned empty audio!")
             return
 
-        # Проверка длины (если < 0.5 сек, скорее всего мусор)
         duration = len(audio_np) / sr_in
-        if duration < 0.5:
+        if duration < 0.1:
              error_log(f"Audio too short ({duration:.2f}s). Skipping to avoid noise.")
              return
 
-        # 1. Нормализация
         max_val = np.max(np.abs(audio_np))
         if max_val > 0.05:
             audio_np = audio_np / max_val * 0.90
         
-        # 2. Ресемплинг
         gcd = np.gcd(sr_in, SAMPLE_RATE_TELEPHONY)
         up = SAMPLE_RATE_TELEPHONY // gcd
         down = sr_in // gcd
         audio_8k = scipy.signal.resample_poly(audio_np, up, down)
         audio_8k = np.clip(audio_8k, -1.0, 1.0)
         
-        # 3. Кодирование
         audio_int16 = (audio_8k * 32767).astype(np.int16)
         audio_bytes = audio_int16.tobytes()
         audio_ulaw = audioop.lin2ulaw(audio_bytes, 2)
@@ -166,8 +158,9 @@ class CallHandler:
         log(f"🔊 Sending {len(audio_ulaw)} bytes ({len(audio_ulaw)/8000:.2f} sec)...")
         
         chunk_size = CHUNK_SIZE_20MS
-        packet_count = 0
-        start_time = time.perf_counter() # <--- ВАЖНО: Засекаем начало
+        
+        self.start_time = time.perf_counter()
+        self.packet_count = 0
 
         for i in range(0, len(audio_ulaw), chunk_size):
             chunk = audio_ulaw[i : i + chunk_size]
@@ -179,14 +172,11 @@ class CallHandler:
             
             self.transport.sendto(header + chunk, self.client_addr)
             
-            # --- КОРРЕКЦИЯ ДРЕЙФА (Drift Correction) ---
-            # Вместо sleep(0.02) мы спим ровно столько, чтобы попасть в следующий такт
-            packet_count += 1
-            expected_time = start_time + (packet_count * 0.02)
+            self.packet_count += 1
+            expected_time = self.start_time + (self.packet_count * 0.02)
             delay = expected_time - time.perf_counter()
             if delay > 0:
                 await asyncio.sleep(delay)
-            # ------------------------------------------
 
 class RTPProtocol(asyncio.DatagramProtocol):
     def __init__(self):
