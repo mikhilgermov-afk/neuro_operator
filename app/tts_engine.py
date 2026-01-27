@@ -1,3 +1,4 @@
+# app/tts_engine.py
 import sys
 import os
 import torch
@@ -45,10 +46,22 @@ class F5TTSWrapper:
         self.checkpoint_file = self._find_file(self.model_path, [".pt", ".safetensors"], "model_")
         self.vocab_file = self._find_file(self.model_path, ["vocab.txt"])
         
-        # 3. Референс (Обрезаем до 5 сек для скорости)
+        # 3. Референс (Аудио + Текст)
         self.ref_audio = "/app/ref_audio.wav"
-        self._trim_reference_audio(self.ref_audio, max_sec=5.0)
-        self.ref_text = "Пример." 
+        self.ref_text_file = "/app/ref_audio.txt"
+        
+        # Загружаем текст референса из файла, если он есть
+        if os.path.exists(self.ref_text_file):
+            with open(self.ref_text_file, "r", encoding="utf-8") as f:
+                self.ref_text = f.read().strip()
+            log(f"Loaded ref_text from file: '{self.ref_text}'")
+        else:
+            # ВАЖНО: Если вы не создали txt файл, этот текст должен совпадать с аудио!
+            self.ref_text = "Пример." 
+            log(f"[WARNING] ref_audio.txt not found! Using default text: '{self.ref_text}'. If audio differs, voice will be broken.")
+
+        # Увеличил лимит до 15 сек, чтобы не резать длинные фразы
+        self._trim_reference_audio(self.ref_audio, max_sec=15.0)
 
         # Вычисляем длину референса в семплах (для обрезки output)
         if os.path.exists(self.ref_audio):
@@ -58,7 +71,7 @@ class F5TTSWrapper:
         else:
             self.ref_len_samples = 0
 
-        # 4. Загрузка
+        # 4. Загрузка моделей
         log("Loading models...")
         self.vocoder = load_vocoder(is_local=False)
         
@@ -89,14 +102,17 @@ class F5TTSWrapper:
 
         log("✅ F5-TTS Engine Ready.")
 
-    def _trim_reference_audio(self, path, max_sec=5.0):
+    def _trim_reference_audio(self, path, max_sec=15.0):
         if not os.path.exists(path): return
         try:
             waveform, sr = torchaudio.load(path)
-            if waveform.shape[1] / sr > max_sec:
+            duration = waveform.shape[1] / sr
+            if duration > max_sec:
+                log(f"Trimming audio from {duration:.2f}s to {max_sec}s")
                 waveform = waveform[:, :int(max_sec * sr)]
                 torchaudio.save(path, waveform, sr)
-                log(f"Ref audio trimmed to {max_sec}s")
+            else:
+                log(f"Ref audio duration: {duration:.2f}s (ok)")
         except Exception as e:
             log(f"Ref audio warning: {e}")
 
@@ -135,13 +151,20 @@ class F5TTSWrapper:
             if isinstance(audio, torch.Tensor):
                 audio = audio.float().cpu().numpy()
             
-            # Отрезаем длину референса (плюс небольшой запас 0.5с на стык)
+            # Отрезаем длину референса (плюс небольшой запас на кроссфейд)
+            # F5 иногда возвращает чуть меньше/больше, поэтому режем аккуратно
             cut_len = self.ref_len_samples
             if len(audio) > cut_len:
                  audio = audio[cut_len:]
-            # ----------------------------------------
+            
+            # Дополнительная защита от "щелчка" в начале
+            if len(audio) > 0:
+                # Плавное нарастание (fade-in) на первых 500 сэмплах (20мс)
+                fade_len = min(500, len(audio))
+                fade_curve = np.linspace(0, 1, fade_len)
+                audio[:fade_len] *= fade_curve
 
-            return sample_rate, audio
+            return 24000, audio # Принудительно возвращаем 24k, так как F5 это гарантирует
         except Exception as e:
             log(f"[ERROR] Generation failed: {e}")
             return 24000, np.zeros(0, dtype=np.float32)

@@ -1,3 +1,4 @@
+# app/main.py
 # -*- coding: utf-8 -*-
 import asyncio
 import audioop
@@ -9,7 +10,6 @@ import time
 import scipy.signal
 import logging
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 log = logging.getLogger(__name__).info
 error_log = logging.getLogger(__name__).error
@@ -17,12 +17,10 @@ error_log = logging.getLogger(__name__).error
 log("Starting Voice Bot service...")
 
 try:
-    log("Importing libraries...")
     from faster_whisper import WhisperModel
     from openai import OpenAI
     from tts_engine import F5TTSWrapper
     import prompts
-    log("Libraries imported.")
 except ImportError as e:
     error_log(f"CRITICAL ERROR importing libraries: {e}")
     sys.exit(1)
@@ -63,8 +61,9 @@ class CallHandler:
         if self.greeting_sent: return
         self.greeting_sent = True
         try:
-            # Короткое приветствие работает лучше
-            sr, audio = tts_engine.generate("Да, я слушаю.")
+            # Сразу генерируем приветствие
+            log("Generating greeting...")
+            sr, audio = tts_engine.generate("Алло, да, я вас слушаю.")
             await self.stream_audio_back(audio, sr)
         except Exception as e:
             error_log(f"Greeting error: {e}")
@@ -78,16 +77,13 @@ class CallHandler:
             return 
 
         rms = audioop.rms(pcm_data, 2)
-        
-        # Порог VAD (300)
         if rms > 300: 
             self.silence_frames = 0
             self.audio_buffer.extend(pcm_data)
         else:
             self.silence_frames += 1
 
-        # Ждем ~1 секунду тишины
-        if self.silence_frames > 50 and len(self.audio_buffer) > 4000:
+        if self.silence_frames > 40 and len(self.audio_buffer) > 4000: # Чуть уменьшил порог тишины для скорости
             audio_to_process = self.audio_buffer[:]
             self.audio_buffer = bytearray()
             self.silence_frames = 0
@@ -101,8 +97,7 @@ class CallHandler:
             # 1. Байты -> Float32
             audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
             
-            # 2. Ресемплинг для Whisper (8k -> 16k)
-            # Используем resample_poly для качества
+            # 2. Ресемплинг
             if len(audio_np) < 100: return
             audio_16k = scipy.signal.resample_poly(audio_np, SAMPLE_RATE_WHISPER, SAMPLE_RATE_TELEPHONY)
 
@@ -121,9 +116,11 @@ class CallHandler:
             messages = prompts.create_messages(self.history)
             completion = await asyncio.to_thread(
                 llm_client.chat.completions.create,
-                model="Qwen/Qwen2.5-7B-Instruct", messages=messages, temperature=0.6, max_tokens=150
+                model="Qwen/Qwen2.5-7B-Instruct", messages=messages, temperature=0.3, max_tokens=100
             )
             bot_text = completion.choices[0].message.content
+            
+            # Если бот все равно выдал английский (подстраховка), вырезаем латиницу или логируем
             log(f"🤖 Bot: {bot_text}")
             self.history.append({"role": "assistant", "content": bot_text})
 
@@ -139,38 +136,39 @@ class CallHandler:
             self.is_speaking = False
 
     async def stream_audio_back(self, audio_np, sr_in):
-        if len(audio_np) == 0: return
+        if len(audio_np) == 0: 
+            error_log("TTS returned empty audio!")
+            return
 
-        # --- 1. Умная нормализация ---
-        # Поднимаем громкость, только если сигнал не пустой шум
+        # Проверка длины (если < 0.5 сек, скорее всего мусор)
+        duration = len(audio_np) / sr_in
+        if duration < 0.5:
+             error_log(f"Audio too short ({duration:.2f}s). Skipping to avoid noise.")
+             return
+
+        # 1. Нормализация
         max_val = np.max(np.abs(audio_np))
-        if max_val > 0.05: # Если есть хоть какой-то голос
-            # Нормализуем до 90% (оставляем запас от клиппинга)
+        if max_val > 0.05:
             audio_np = audio_np / max_val * 0.90
         
-        # --- 2. Качественный ресемплинг (24k -> 8k) ---
-        # resample_poly убирает "трубный" звон (aliasing)
-        # up=1, down=3 (24000 * 1 / 3 = 8000)
-        # Если sr_in=24000, то up=1, down=3.
-        # Вычисляем НОД для произвольных частот:
+        # 2. Ресемплинг
         gcd = np.gcd(sr_in, SAMPLE_RATE_TELEPHONY)
         up = SAMPLE_RATE_TELEPHONY // gcd
         down = sr_in // gcd
-        
         audio_8k = scipy.signal.resample_poly(audio_np, up, down)
-        
-        # --- 3. Клиппинг ---
-        # Жестко срезаем пики, которые могли возникнуть при фильтрации
         audio_8k = np.clip(audio_8k, -1.0, 1.0)
         
-        # --- 4. Кодирование ---
+        # 3. Кодирование
         audio_int16 = (audio_8k * 32767).astype(np.int16)
         audio_bytes = audio_int16.tobytes()
         audio_ulaw = audioop.lin2ulaw(audio_bytes, 2)
 
-        log(f"🔊 Sending {len(audio_ulaw)} bytes...")
+        log(f"🔊 Sending {len(audio_ulaw)} bytes ({len(audio_ulaw)/8000:.2f} sec)...")
         
         chunk_size = CHUNK_SIZE_20MS
+        packet_count = 0
+        start_time = time.perf_counter() # <--- ВАЖНО: Засекаем начало
+
         for i in range(0, len(audio_ulaw), chunk_size):
             chunk = audio_ulaw[i : i + chunk_size]
             if len(chunk) < chunk_size: chunk += b'\xff' * (chunk_size - len(chunk))
@@ -180,7 +178,15 @@ class CallHandler:
             header = struct.pack('!BBHII', 0x80, 0x00, self.seq_num, self.timestamp, self.ssrc)
             
             self.transport.sendto(header + chunk, self.client_addr)
-            await asyncio.sleep(0.0195) 
+            
+            # --- КОРРЕКЦИЯ ДРЕЙФА (Drift Correction) ---
+            # Вместо sleep(0.02) мы спим ровно столько, чтобы попасть в следующий такт
+            packet_count += 1
+            expected_time = start_time + (packet_count * 0.02)
+            delay = expected_time - time.perf_counter()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            # ------------------------------------------
 
 class RTPProtocol(asyncio.DatagramProtocol):
     def __init__(self):
