@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  # LLM Сервер (Qwen 2.5) - Мозг
+  llm-server:
+    image: vllm/vllm-openai:latest
+    container_name: llm_server
+    runtime: nvidia
+    environment:
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      # Явно указываем путь к кэшу внутри контейнера
+      - HF_HOME=/root/.cache/huggingface # <--- ДОБАВЛЕНО
+    command: --model Qwen/Qwen2.5-7B-Instruct --dtype auto --api-key sk-local-key --max-model-len 4096 --port 8085 --gpu-memory-utilization 0.6
+    ports:
+      - "8085:8085"
+    volumes:
+      # Пробрасываем папку models/llm с твоего компа в папку кэша контейнера
+      - ./models/llm:/root/.cache/huggingface # <--- ДОБАВЛЕНО
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  # Основное приложение (Voice Logic + TTS + STT)
+  voice-bot:
+    build: .
+    container_name: voice_bot
+    runtime: nvidia
+    ports:
+      - "10000:10000/udp"
+      - "10001:10001/udp"
+    volumes:
+      - ./app:/app
+      # Пробрасываем папку models/voice с компа в /models внутри контейнера
+      - ./models/voice:/models # <--- ИЗМЕНЕНО (лучше разделить папки LLM и Voice)
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - LLM_API_URL=http://llm-server:8085/v1
+      - TTS_MODEL_REPO=Misha24-10/F5-TTS_RUSSIAN
+      # Передаем токен (нужен для скачивания некоторых моделей)
+      - HF_TOKEN=${HF_TOKEN} # <--- ДОБАВЛЕНО
+      # Говорим скриптам искать модели в примонтированной папке
+      - HF_HOME=/models/hf   # <--- ДОБАВЛЕНО (теперь F5 и Whisper будут качать сюда)
+    depends_on:
+      - llm-server
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]

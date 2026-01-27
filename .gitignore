@@ -1,0 +1,38 @@
+# --- Python & System Junk ---
+__pycache__/
+*.py[cod]
+*$py.class
+.DS_Store
+Thumbs.db
+*.log
+
+# --- Virtual Environments ---
+venv/
+.venv/
+env/
+
+# --- Secrets (ВАЖНО!) ---
+.env
+.env.local
+# Если у тебя есть ключи внутри кода (надеюсь, нет), убери их оттуда!
+
+# --- Heavy Model Weights & Cache (САМОЕ ВАЖНОЕ) ---
+# Игнорируем всё внутри папок моделей, так как они качаются при билде
+models/llm/*
+models/voice/*
+models/hf/*
+
+# Игнорируем кэш HuggingFace, если он вдруг создался локально
+.cache/
+
+# --- Docker ---
+# Если у тебя создаются какие-то временные файлы докера
+docker-compose.override.yml
+
+# --- IDE Settings ---
+.idea/
+.vscode/
+
+# Разрешаем загружать заглушки, чтобы структура папок сохранилась
+!models/llm/.gitkeep
+!models/voice/.gitkeep

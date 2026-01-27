@@ -1,0 +1,18 @@
+numpy
+scipy
+torch
+torchaudio
+soundfile
+pydub
+requests
+openai
+python-dotenv
+uvloop
+
+# STT & VAD
+faster-whisper
+silero-vad
+
+# F5-TTS dependencies
+accelerate
+f5-tts @ git+https://github.com/SWivid/F5-TTS.git
