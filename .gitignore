@@ -21,6 +21,7 @@ env/
 models/llm/*
 models/voice/*
 models/hf/*
+recordings/*
 
 # Игнорируем кэш HuggingFace, если он вдруг создался локально
 .cache/

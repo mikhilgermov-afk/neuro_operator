@@ -78,6 +78,7 @@ services:
       - ./models/hf:/models/hf
       - ./models/torch:/models/torch
       - ./models/xdg:/models/xdg
+      - ./recordings:/recordings
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
       - HF_HOME=/models/hf
@@ -89,6 +90,8 @@ services:
       - HF_TOKEN=${HF_TOKEN}
       - LLM_API_URL=http://llm-server:8085/v1
       - TTS_API_URL=http://tts-service:10002
+      - RECORD_CALLS=1
+      - RECORDINGS_DIR=/recordings
     depends_on:
       - llm-server
       - tts-service
