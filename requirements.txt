@@ -8,11 +8,13 @@ requests
 openai
 python-dotenv
 uvloop
+websockets
+fastapi
+uvicorn
 
-# STT & VAD
-faster-whisper
+faster-whisper==1.2.1
+ctranslate2==4.4.0
+
 silero-vad
-
-# F5-TTS dependencies
 accelerate
 f5-tts @ git+https://github.com/SWivid/F5-TTS.git

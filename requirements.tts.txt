@@ -1,0 +1,10 @@
+fastapi>=0.115.2,<1.0.0
+uvicorn[standard]==0.30.1
+soundfile==0.12.1
+ffmpeg-python==0.2.0
+numpy==1.26.4
+requests==2.32.3
+huggingface_hub>=0.33.5,<2.0.0
+ruaccent==1.5.8.3
+
+git+https://github.com/SWivid/F5-TTS.git@main

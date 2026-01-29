@@ -1,21 +1,19 @@
-version: '3.8'
-
 services:
-  # LLM Сервер (Qwen 2.5) - Мозг
   llm-server:
     image: vllm/vllm-openai:latest
     container_name: llm_server
     runtime: nvidia
     environment:
       - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
-      # Явно указываем путь к кэшу внутри контейнера
-      - HF_HOME=/root/.cache/huggingface # <--- ДОБАВЛЕНО
+      - HF_HOME=/root/.cache/huggingface
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      - HF_HUB_CACHE=/root/.cache/huggingface/hub
+      - XDG_CACHE_HOME=/root/.cache
     command: --model Qwen/Qwen2.5-7B-Instruct --dtype auto --api-key sk-local-key --max-model-len 4096 --port 8085 --gpu-memory-utilization 0.6
     ports:
       - "8085:8085"
     volumes:
-      # Пробрасываем папку models/llm с твоего компа в папку кэша контейнера
-      - ./models/llm:/root/.cache/huggingface # <--- ДОБАВЛЕНО
+      - ./models/llm:/root/.cache/huggingface
     deploy:
       resources:
         reservations:
@@ -24,9 +22,52 @@ services:
               count: 1
               capabilities: [gpu]
 
-  # Основное приложение (Voice Logic + TTS + STT)
+  tts-service:
+    build:
+      context: .
+      dockerfile: Dockerfile.tts
+    container_name: tts_service
+    runtime: nvidia
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/models/hf
+      - HF_HUB_CACHE=/models/hf/hub
+      - TRANSFORMERS_CACHE=/models/hf/transformers
+      - TORCH_HOME=/models/torch
+      - XDG_CACHE_HOME=/models/xdg
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN}
+      - TTS_MODEL_REPO=Misha24-10/F5-TTS_RUSSIAN
+      - TTS_DEVICE=cuda
+      - TTS_MODEL_DIR=/models/tts
+      - TTS_REF_AUDIO=/refs/ref_audio.wav
+      - TTS_REF_TEXT=/refs/ref_audio.txt
+      - RUACCENT_ENABLED=1
+      - TTS_HOST=0.0.0.0
+      - TTS_PORT=10002
+    volumes:
+      - ./app:/app
+      - ./models/hf:/models/hf
+      - ./models/tts:/models/tts
+      - ./models/torch:/models/torch
+      - ./models/xdg:/models/xdg
+      - ./app/ref_audio.wav:/refs/ref_audio.wav:ro
+      - ./app/ref_audio.txt:/refs/ref_audio.txt:ro
+    ports:
+      - "10002:10002"
+    command: python -u /app/tts_service.py
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
   voice-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile.voice
     container_name: voice_bot
     runtime: nvidia
     ports:
@@ -34,18 +75,24 @@ services:
       - "10001:10001/udp"
     volumes:
       - ./app:/app
-      # Пробрасываем папку models/voice с компа в /models внутри контейнера
-      - ./models/voice:/models # <--- ИЗМЕНЕНО (лучше разделить папки LLM и Voice)
+      - ./models/hf:/models/hf
+      - ./models/torch:/models/torch
+      - ./models/xdg:/models/xdg
     environment:
       - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/models/hf
+      - HF_HUB_CACHE=/models/hf/hub
+      - TRANSFORMERS_CACHE=/models/hf/transformers
+      - TORCH_HOME=/models/torch
+      - XDG_CACHE_HOME=/models/xdg
+      - HUGGING_FACE_HUB_TOKEN=${HF_TOKEN}
+      - HF_TOKEN=${HF_TOKEN}
       - LLM_API_URL=http://llm-server:8085/v1
-      - TTS_MODEL_REPO=Misha24-10/F5-TTS_RUSSIAN
-      # Передаем токен (нужен для скачивания некоторых моделей)
-      - HF_TOKEN=${HF_TOKEN} # <--- ДОБАВЛЕНО
-      # Говорим скриптам искать модели в примонтированной папке
-      - HF_HOME=/models/hf   # <--- ДОБАВЛЕНО (теперь F5 и Whisper будут качать сюда)
+      - TTS_API_URL=http://tts-service:10002
     depends_on:
       - llm-server
+      - tts-service
+    command: python -u /app/main.py
     deploy:
       resources:
         reservations:
@@ -53,3 +100,21 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+
+  ari-controller:
+    build:
+      context: .
+      dockerfile: Dockerfile.voice
+    container_name: ari_controller
+    volumes:
+      - ./app:/app
+    environment:
+      - ARI_BASE_URL=http://172.20.20.10:8088/ari
+      - ARI_USER=phonebotMikh
+      - ARI_PASS=TEST_SECRET
+      - ARI_APP=voicebot
+      - EXTERNAL_MEDIA_HOST=10.228.228.2:10000
+      - EXTERNAL_MEDIA_FORMAT=ulaw
+    depends_on:
+      - voice-bot
+    command: python -u /app/ari_controller.py
